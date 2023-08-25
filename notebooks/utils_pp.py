@@ -1,5 +1,8 @@
 import pandas as pd
 import re
+import torch
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 
 def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="data/mappingccl.csv", cell_col:str ="cell_line"):
     cell_mapping = pd.read_csv(mapping_file, usecols=["Aliases", "CCLE_Name", "Broad_ID"])
@@ -27,6 +30,94 @@ def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="data/
 #     y = X["target"]
 #     X.drop(columns="target")
 #     return X.reset_index(drop=True), y.reset_index(drop=True)
+
+class Encoder(torch.nn.Module):
+    def __init__(self, h_sizes=None, dropout=0.2):
+        self.h_sizes = h_sizes
+        super().__init__()
+        if h_sizes is None: h_sizes = [32,32,32,32]
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(h_sizes[0], h_sizes[1]),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(h_sizes[1], h_sizes[2]),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(h_sizes[2], h_sizes[3])
+        )
+    def forward(self, x):
+        encoded = self.encoder(x)
+        return encoded
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = np.inf
+
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
+    
+class AE_DNN(torch.nn.Module):
+    def __init__(self, h_sizes):
+        super().__init__()
+        self.drug_encoder = Encoder(h_sizes=[drug_length, 512, 512, 256, 512, 512])
+        self.cell_encoder = Encoder(h_sizes=[cell_length, 512, 512, 256, 512, 512])
+        self.hidden = nn.ModuleList()
+        for k in range(len(h_sizes)-1):
+            self.hidden.append(nn.Linear(h_sizes[k], h_sizes[k+1]))
+            self.hidden.append(nn.Dropout(0.1))
+            self.hidden.append(nn.ReLU())
+        self.hidden.append(nn.Linear(h_sizes[-1], 1))
+    def forward(self, x):
+        drug_A, drug_B, cell, drugA_conc, drugB_conc = torch.split(x, [drug_length, drug_length, cell_length, 1, 1], dim=1)
+        drug_A_emb = self.drug_encoder(drug_A)
+        drug_B_emb = self.drug_encoder(drug_B)
+        cell_emb = self.cell_encoder(cell)
+        x = torch.concatenate([drug_A_emb, drug_B_emb, cell_emb, drugA_conc, drugB_conc], dim=1)
+        for lay in self.hidden:
+            # print(torch.sum(torch.isnan(x)))
+            # print(torch.sum(x>1e3))
+            x = lay(x)
+        return x
+
+class Dataset_from_pd(Dataset):
+    def __init__(self, drug_comb_data, drug_feat, cell_feat):
+        self.drug_comb_data = drug_comb_data.to_numpy()
+        self.drug_feat = drug_feat.to_numpy()
+        self.cell_feat = cell_feat.to_numpy()
+        self.drug_mapping = pd.Series(range(len(self.drug_feat)), index=drug_feat.index).to_dict()
+        self.cell_mapping = pd.Series(range(len(self.cell_feat)), index=cell_feat.index).to_dict()
+        # print(self.cell_mapping, self.drug_mapping)
+
+        print()
+    def __len__(self):
+        return len(self.drug_comb_data)
+    
+    def __getitem__(self, idx):
+        combi = self.drug_comb_data[idx]
+        drug_A = self.drug_feat[self.drug_mapping[combi[1]]]
+        drug_B = self.drug_feat[self.drug_mapping[combi[2]]]
+        cell_line = self.cell_feat[self.cell_mapping[combi[0]]]
+
+
+        return np.concatenate([drug_A, drug_B, cell_line, combi[3:5].astype("float32")], dtype="float32"), combi[5:6].astype("float32")
+
+train_set  = Dataset_from_pd(df_train, drug_data, cell_data)
+train_dl = DataLoader(train_set, batch_size=256, shuffle=True)
+xi, yi = next(iter(train_dl))
+print(xi.shape, yi.shape)
+# print(np.argwhere(xi>1e2))
+# print(tuple(np.argwhere(xi>100)))
+print(xi.numpy()[tuple(np.argwhere(xi>100))])
+# print(xi.numpy()[:,tuple(np.argwhere(xi>100))[1]])
 
 if __name__=="__main__":
 
