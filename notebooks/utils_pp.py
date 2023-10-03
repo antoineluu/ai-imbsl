@@ -1,8 +1,13 @@
 import pandas as pd
 import re
 import torch
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from matplotlib import cm
+
 
 def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="data/mappingccl.csv", cell_col:str ="cell_line"):
     cell_mapping = pd.read_csv(mapping_file, usecols=["Aliases", "CCLE_Name", "Broad_ID"])
@@ -31,6 +36,42 @@ def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="data/
 #     X.drop(columns="target")
 #     return X.reset_index(drop=True), y.reset_index(drop=True)
 
+def pcc_fn(outputs, labels):
+
+        vx = outputs - torch.mean(outputs)
+        vy = labels - torch.mean(labels)
+        return torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
+def train_one_epoch(model, epoch_index, tb_writer, training_loader, optimizer, loss_fn, device, L1=0, verbose=False, print_every=10):
+    running_loss = 0.
+    last_loss = 0.
+    model = model.to(device)
+    for i, data in enumerate(training_loader):
+        inputs, labels = data
+        inputs = inputs.to(device=device)
+        labels = labels.to(device=device)
+        # Zero your gradients for every batch!
+        optimizer.zero_grad()
+        outputs = model.forward(inputs)
+
+        params = torch.cat([x.view(-1) for x in model.parameters()])
+        l1_regularization = L1 * torch.linalg.vector_norm(params, 1)
+
+        # Compute the loss and its gradients
+        loss = loss_fn(outputs, labels) + l1_regularization
+        loss.backward()
+
+        # Adjust learning weights
+        optimizer.step()
+        running_loss += loss.item()
+        # print(running_loss)
+        if i % print_every == print_every-1:
+            last_loss = running_loss / print_every # loss per batch
+            # print('  batch {} loss: {}'.format(i + 1, last_loss), outputs[0][0].item(), labels[0][0].item())
+            # tb_x = epoch_index * len(training_loader) + i + 1
+            # tb_writer.add_scalar('Loss/train', last_loss, tb_x)
+            running_loss = 0.
+
+    return last_loss
 class Encoder(torch.nn.Module):
     def __init__(self, h_sizes=None, dropout=0.2):
         self.h_sizes = h_sizes
@@ -66,8 +107,10 @@ class EarlyStopper:
         return False
     
 class AE_DNN(torch.nn.Module):
-    def __init__(self, h_sizes):
+    def __init__(self, h_sizes, drug_length, cell_length):
         super().__init__()
+        self.drug_length = drug_length
+        self.cell_length = cell_length
         self.drug_encoder = Encoder(h_sizes=[drug_length, 512, 512, 256, 512, 512])
         self.cell_encoder = Encoder(h_sizes=[cell_length, 512, 512, 256, 512, 512])
         self.hidden = nn.ModuleList()
@@ -76,8 +119,9 @@ class AE_DNN(torch.nn.Module):
             self.hidden.append(nn.Dropout(0.1))
             self.hidden.append(nn.ReLU())
         self.hidden.append(nn.Linear(h_sizes[-1], 1))
+
     def forward(self, x):
-        drug_A, drug_B, cell, drugA_conc, drugB_conc = torch.split(x, [drug_length, drug_length, cell_length, 1, 1], dim=1)
+        drug_A, drug_B, cell, drugA_conc, drugB_conc = torch.split(x, [self.drug_length, self.drug_length, self.cell_length, 1, 1], dim=1)
         drug_A_emb = self.drug_encoder(drug_A)
         drug_B_emb = self.drug_encoder(drug_B)
         cell_emb = self.cell_encoder(cell)
@@ -87,6 +131,14 @@ class AE_DNN(torch.nn.Module):
             # print(torch.sum(x>1e3))
             x = lay(x)
         return x
+    
+def prepare_train_val(df_train, unique_pairs):
+    train_unique_pairs, val_unique_pairs = train_test_split(unique_pairs, test_size=0.2, random_state=42)
+    combined_train = train_unique_pairs.loc[:,"drugA_name"].str.cat(train_unique_pairs.loc[:,"drugB_name"], sep= " + ")
+    combined_val = val_unique_pairs.loc[:,"drugA_name"].str.cat(val_unique_pairs.loc[:,"drugB_name"], sep= " + ")
+
+    data_train = df_train[df_train.loc[:,"drugA_name"].str.cat(df_train.loc[:,"drugB_name"],sep=" + ").isin(combined_train)]
+    data_val = df_train[df_train.loc[:,"drugA_name"].str.cat(df_train.loc[:,"drugB_name"],sep=" + ").isin(combined_val)]
 
 class Dataset_from_pd(Dataset):
     def __init__(self, drug_comb_data, drug_feat, cell_feat):
@@ -110,15 +162,48 @@ class Dataset_from_pd(Dataset):
 
         return np.concatenate([drug_A, drug_B, cell_line, combi[3:5].astype("float32")], dtype="float32"), combi[5:6].astype("float32")
 
-train_set  = Dataset_from_pd(df_train, drug_data, cell_data)
-train_dl = DataLoader(train_set, batch_size=256, shuffle=True)
-xi, yi = next(iter(train_dl))
-print(xi.shape, yi.shape)
-# print(np.argwhere(xi>1e2))
-# print(tuple(np.argwhere(xi>100)))
-print(xi.numpy()[tuple(np.argwhere(xi>100))])
-# print(xi.numpy()[:,tuple(np.argwhere(xi>100))[1]])
+def plot_from_df(data, model, device, drug_data, cell_data, title="Prediction over full experimental design (88 epochs)"):
 
+    ssize = 30
+    fig = plt.figure(figsize=(12,12))
+    fig.tight_layout()
+
+    ax = fig.add_subplot(projection='3d')
+
+    ax.stem(data.drugA_conc, data.drugB_conc, data.target, markerfmt='or', linefmt="--b")
+    Z = np.empty((ssize,ssize))
+    A = np.linspace(data.drugA_conc.min(),data.drugA_conc.max(), ssize)
+    B = np.linspace(data.drugB_conc.min(),data.drugB_conc.max(), ssize)
+    X,Y = np.meshgrid(A,B)
+    # Conc = np.concatenate([X,Y]).reshape((-1,2), order='C')
+    for m in range(X.shape[0]):
+        for n in range(X.shape[1]):
+            sample_comb = data.iloc[0:1, 0:3]
+            sample_comb["drugA_conc"] = X[m,n]
+            sample_comb["drugB_conc"] = Y[m,n]
+            sample_comb["target"] = data.iloc[0:1, 5:6]
+            sample_set  = Dataset_from_pd(sample_comb, drug_data, cell_data)
+            sample, _ = next(iter(DataLoader(sample_set)))
+            sample = sample.to(device)
+            predict = model(sample)
+            Z[m,n] = predict
+
+    # ax.scatter()
+
+    # Plot a basic wireframe.
+    norm = plt.Normalize(Z.min(), Z.max())
+    colors = cm.viridis(norm(Z))
+    rcount, ccount, _ = colors.shape
+    surf = ax.plot_surface(X, Y, Z, rcount=rcount, ccount=ccount, facecolors=colors, shade=False)
+    surf.set_facecolor((0,0,0,0))
+    ax.set_xlabel("{} (muM)".format(data.drugA_name.iloc[0]), size=20)
+    ax.set_ylabel("{} (muM)".format(data.drugB_name.iloc[0]), size=20)
+    ax.set_zlabel("Sensitivty X:X0", size=20)
+    ax.set_title("Cell line : " +data.cell_line.iloc[0], size=20)
+    ax.view_init(25, 35)
+    plt.suptitle(title, size=25)
+
+    
 if __name__=="__main__":
 
     columns = ["cell_line", "drugA_name", "drugB_name", "drugA_conc", "drugB_conc", "target"]
