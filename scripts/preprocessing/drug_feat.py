@@ -47,9 +47,6 @@ for i,x in enumerate(identifiers) :
     except Exception as e: 
         print("boo ", x, e)
 
-
-
-
 # pd.concat([pd.Series(identifiers, name="drug_name"),pd.DataFrame(fgp),pd.DataFrame(mol_desc)], axis=1).to_pickle("data/drug_data.pkl.compress", compression="gzip")
 export = pd.DataFrame(
     pd.concat([
@@ -57,6 +54,7 @@ export = pd.DataFrame(
         pd.DataFrame(mol_desc)
     ], axis=1)
 )
+
 export.dropna(axis=1, inplace=True)
 cols = export.columns.astype("str")
 scaler = StandardScaler()

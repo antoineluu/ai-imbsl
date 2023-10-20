@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 
 
-def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="data/mappingccl.csv", cell_col:str ="cell_line"):
+def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="../data/mappingccl.csv", cell_col:str ="cell_line"):
     cell_mapping = pd.read_csv(mapping_file, usecols=["Aliases", "CCLE_Name", "Broad_ID"])
     clean = lambda s: str(s).replace('-','').replace(' ','').replace('_','').replace(':','').replace(';','').upper()
     alias2id={}
@@ -35,6 +35,53 @@ def replace_cell_names_with_id(dataframe: pd.DataFrame, mapping_file:str ="data/
 #     y = X["target"]
 #     X.drop(columns="target")
 #     return X.reset_index(drop=True), y.reset_index(drop=True)
+
+def plot_from_df(data, model, device, drug_data, cell_data, title="Prediction over full experimental design (88 epochs)", test=False, ssize =30):
+    cell_mapping = pd.read_csv("../data/mappingccl.csv", usecols=["CCLE_Name","Broad_ID"]).drop_duplicates("Broad_ID")
+    cell_mapping = cell_mapping.set_index(keys="Broad_ID")
+    
+    # ssize = 30
+    fig = plt.figure(figsize=(15,15))
+    fig.tight_layout()
+
+    ax = fig.add_subplot(projection='3d')
+
+
+    ax.stem(data.drugA_conc, data.drugB_conc, data.target, markerfmt='or', linefmt="--b")
+    Z = np.empty((ssize,ssize))
+    A = np.linspace(data.drugA_conc.min(),data.drugA_conc.max(), ssize)
+    B = np.linspace(data.drugB_conc.min(),data.drugB_conc.max(), ssize)
+    if test:
+        A = np.linspace(0.01,data.drugA_conc.max(), ssize)
+        B = np.linspace(0.01,data.drugB_conc.max(), ssize)
+    X,Y = np.meshgrid(A,B)
+    # Conc = np.concatenate([X,Y]).reshape((-1,2), order='C')
+    for m in range(X.shape[0]):
+        for n in range(X.shape[1]):
+            sample_comb = data.iloc[0:1, 0:3]
+            sample_comb["drugA_conc"] = X[m,n]
+            sample_comb["drugB_conc"] = Y[m,n]
+            sample_comb["target"] = data.iloc[0:1, 5:6]
+            sample_set  = Dataset_from_pd(sample_comb, drug_data, cell_data)
+            sample, _ = next(iter(DataLoader(sample_set)))
+            sample = sample.to(device)
+            predict = model(sample)
+            Z[m,n] = predict
+
+    # ax.scatter()
+    # print(cell_mapping.loc[data.cell_line.iloc[0]])
+    # Plot a basic wireframe.
+    norm = plt.Normalize(Z.min(), Z.max())
+    colors = cm.viridis(norm(Z))
+    rcount, ccount, _ = colors.shape
+    surf = ax.plot_surface(X, Y, Z, rcount=rcount, ccount=ccount, facecolors=colors, shade=False)
+    surf.set_facecolor((0,0,0,0))
+    ax.set_xlabel("{} (muM)".format(data.drugA_name.iloc[0]), size=25)
+    ax.set_ylabel("{} (muM)".format(data.drugB_name.iloc[0]), size=25)
+    ax.set_zlabel("Cell viability X/X0", size=23)
+    ax.set_title("Cell line : " +str(cell_mapping.loc[data.cell_line.iloc[0]].to_numpy()[0]), size=25)
+    ax.view_init(25, 35)
+    # plt.suptitle(title, size=25)
 
 def pcc_fn(outputs, labels):
 
@@ -162,46 +209,7 @@ class Dataset_from_pd(Dataset):
 
         return np.concatenate([drug_A, drug_B, cell_line, combi[3:5].astype("float32")], dtype="float32"), combi[5:6].astype("float32")
 
-def plot_from_df(data, model, device, drug_data, cell_data, title="Prediction over full experimental design (88 epochs)"):
 
-    ssize = 30
-    fig = plt.figure(figsize=(12,12))
-    fig.tight_layout()
-
-    ax = fig.add_subplot(projection='3d')
-
-    ax.stem(data.drugA_conc, data.drugB_conc, data.target, markerfmt='or', linefmt="--b")
-    Z = np.empty((ssize,ssize))
-    A = np.linspace(data.drugA_conc.min(),data.drugA_conc.max(), ssize)
-    B = np.linspace(data.drugB_conc.min(),data.drugB_conc.max(), ssize)
-    X,Y = np.meshgrid(A,B)
-    # Conc = np.concatenate([X,Y]).reshape((-1,2), order='C')
-    for m in range(X.shape[0]):
-        for n in range(X.shape[1]):
-            sample_comb = data.iloc[0:1, 0:3]
-            sample_comb["drugA_conc"] = X[m,n]
-            sample_comb["drugB_conc"] = Y[m,n]
-            sample_comb["target"] = data.iloc[0:1, 5:6]
-            sample_set  = Dataset_from_pd(sample_comb, drug_data, cell_data)
-            sample, _ = next(iter(DataLoader(sample_set)))
-            sample = sample.to(device)
-            predict = model(sample)
-            Z[m,n] = predict
-
-    # ax.scatter()
-
-    # Plot a basic wireframe.
-    norm = plt.Normalize(Z.min(), Z.max())
-    colors = cm.viridis(norm(Z))
-    rcount, ccount, _ = colors.shape
-    surf = ax.plot_surface(X, Y, Z, rcount=rcount, ccount=ccount, facecolors=colors, shade=False)
-    surf.set_facecolor((0,0,0,0))
-    ax.set_xlabel("{} (muM)".format(data.drugA_name.iloc[0]), size=20)
-    ax.set_ylabel("{} (muM)".format(data.drugB_name.iloc[0]), size=20)
-    ax.set_zlabel("Sensitivty X:X0", size=20)
-    ax.set_title("Cell line : " +data.cell_line.iloc[0], size=20)
-    ax.view_init(25, 35)
-    plt.suptitle(title, size=25)
 
     
 if __name__=="__main__":
